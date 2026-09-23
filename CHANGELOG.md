@@ -2,6 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
+
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
@@ -33,7 +34,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Security Researchers
 
-We感谢 the following researchers for responsibly disclosing
+We thank the following researchers for responsibly disclosing
 vulnerabilities:
 
 _(No disclosures yet)_

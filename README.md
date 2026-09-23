@@ -2,7 +2,9 @@
   <img src="https://trustrove.vercel.app/og-image.png" alt="TrusTrove Contracts" width="600" />
 </p>
 
+
 <h1 align="center">TrusTrove — Smart Contracts</h1>
+
 
 <p align="center">
   Four Soroban smart contracts powering the TrusTrove trade finance protocol on Stellar.
@@ -16,6 +18,9 @@
 <p align="center">
   <a href="https://github.com/TrusTrove/TrusTrove-contract/actions/workflows/ci.yml">
     <img src="https://img.shields.io/github/actions/workflow/status/TrusTrove/TrusTrove-contract/ci.yml?branch=main&label=build" />
+  </a>
+  <a href="https://codecov.io/gh/TrusTrove/TrusTrove-contract">
+    <img src="https://img.shields.io/codecov/c/github/TrusTrove/TrusTrove-contract?label=coverage" />
   </a>
   <img src="https://img.shields.io/badge/rust-1.85.0-orange" />
   <img src="https://img.shields.io/badge/soroban--sdk-21.7.6-blueviolet" />
@@ -47,12 +52,14 @@ Join the contributor community: **[t.me/trusttrove](https://t.me/trusttrove)**
 
 ### Maintainer Tooling
 
-Seed-issue generator scripts live in [`scripts/maintainer/`](./scripts/maintainer/):
+Seed-issue generator scripts live in [`scripts/maintainer/`](./scripts/maintainer/), which is the **only supported location** for this tooling:
 
 - `create_issues.py` — generate issues from a template
 - `create-contract-issues.sh` / `create-contract-issues.ps1` — shell/PowerShell helpers
 
 Run any script from the repo root, e.g. `bash scripts/maintainer/create-contract-issues.sh`.
+
+> Any `create_issues.*` files found at the repo root are stale duplicates left over from before this tooling was consolidated under `scripts/maintainer/`. Do not use them — they lack the rate-limit/dedup guards the `scripts/maintainer/` versions have.
 
 ---
 
@@ -60,7 +67,7 @@ Run any script from the repo root, e.g. `bash scripts/maintainer/create-contract
 
 ### registry_contract
 
-Tracks verified SME issuers and buyers. Every other contract calls `is_verified()` before allowing any action.
+Tracks verified SME issuers and buyers.
 
 ```
 initialize(admin)
@@ -71,9 +78,24 @@ get_profile(address) → Profile
 revoke(address) → bool
 ```
 
+**Revocation is prospective, not retroactive.** `is_verified()` is re-checked
+at every point where new business gets committed — `invoice.create()`,
+`invoice.list_for_financing()`, and `pool.fund_invoice()` — so a revoked
+issuer or buyer can't originate, list, or get funded on a new invoice. It is
+**not** re-checked at any later lifecycle step (`mark_shipped`,
+`confirm_delivery`, `repay`, `repay_early`, `trigger_default`): once an
+invoice is `Funded`, pool capital is already committed and the repayment
+terms are already fixed, so a later `revoke()` does not unwind, freeze, or
+force-default an in-flight invoice. This is a deliberate choice — unwinding
+committed capital on revocation would be disruptive to LPs and gameable
+(e.g. an issuer could grief the pool by getting itself revoked mid-term to
+force a default). Admins who need to stop a specific in-flight invoice have
+`invoice.trigger_default()` (past due date) as the existing mechanism; there
+is no separate "freeze this invoice" primitive.
+
 ### invoice_contract
 
-Manages the full invoice lifecycle. Enforces valid state transitions. Emits events consumed by the Go indexer.
+Manages the full invoice lifecycle. Enforces valid state transitions. [Emits events](./docs/EVENTS.md#invoice-contract) consumed by the Go indexer.
 
 ```
 Created → Listed → Funded → Active → Confirmed → Repaid
@@ -81,7 +103,8 @@ Created → Listed → Funded → Active → Confirmed → Repaid
 ```
 
 ```
-create(issuer, buyer, face_value, due_date) → invoice_id
+create(issuer, buyer, face_value, due_date, funding_asset) → invoice_id
+submit_attestation(invoice_id, payload, signature) → bool
 list_for_financing(invoice_id, discount_bps) → bool
 mark_funded(invoice_id, funded_amount) → bool   ← pool_contract only
 mark_shipped(invoice_id) → bool
@@ -89,8 +112,10 @@ confirm_delivery(invoice_id, confirmer) → bool  ← dual confirmation required
 repay(invoice_id) → bool
 trigger_default(invoice_id) → bool
 get(invoice_id) → Invoice
+get_attestation(invoice_id) → Option<Attestation>
 get_by_status(status) → Vec<Invoice>
 get_by_issuer(address) → Vec<Invoice>
+set_agent_registry_contract(agent_registry_contract) → bool
 ```
 
 ### escrow_contract
@@ -112,7 +137,7 @@ USDC liquidity pool with share-based LP accounting. Share price grows as invoice
 ```
 deposit(lp, usdc_amount) → shares
 withdraw(lp, shares) → usdc_amount
-fund_invoice(invoice_id) → bool
+fund_invoice(invoice_id) → bool         ← re-verifies issuer & buyer against registry_contract
 receive_repayment(invoice_id, amount) → bool  ← invoice_contract only
 handle_default(invoice_id) → bool
 get_stats() → PoolStats
@@ -148,6 +173,11 @@ get_lp_position(address) → LPPosition
           └───────────────────┘
 ```
 
+`pool_contract` also calls `registry_contract.is_verified()` directly
+(not shown above) as part of `fund_invoice`, re-checking the issuer and
+buyer before committing capital. See "Revocation is prospective, not
+retroactive" above.
+
 ### Invoice Lifecycle & Fund Movement
 
 Each step below documents what happens to USDC and which contracts are called.
@@ -162,6 +192,8 @@ Pool ──[shares]──► LP
 
 #### Step 2 — Create & List (no funds move)
 The issuer creates an invoice (recording `face_value`, `due_date`, `buyer`, `funding_asset`), then lists it with a `discount_bps` expressing the yield they will give up in exchange for immediate liquidity.
+
+Before listing, an Underwrite agent must sign an `AttestationPayload` (containing `domain_separator`, `invoice_id`, `risk_score`, `evidence_hash`, `agent_id`, `nonce`) off-chain with a secp256k1 key. Anyone can relay this signature via `submit_attestation`, which recovers the signer and verifies it against the agent-registry contract (deployed separately from the `underwrite-contract` repo). The agent-registry address is configured via `set_agent_registry_contract` (admin-only). `list_for_financing` panics with `VerificationRequired` until a valid attestation exists for the invoice.
 
 ```
 No fund movement. Invoice status: Created → Listed.
@@ -244,12 +276,16 @@ Invoice status: → Defaulted
 
 ## Deployed Contracts (Stellar Testnet)
 
+<!-- START_DEPLOYED_ADDRESSES -->
 | Contract | Address |
 |----------|---------|
 | registry_contract | `CABGWVIZFF62FG67ZGFEP67NEEY4WYTMFURDMFTKKNRDAFPKPOJDTN4C` |
 | invoice_contract | `CA4O3MR7LWHRSUDBNU6FY6UDFFYBN7TGBZXBDZB4OYYXFYXIFJ6RJF6B` |
 | escrow_contract | `CAJWGUKDTTC3SKN4RAAY72J4DVIIYSCFHX6GIMNTT22ABMISJK4GBCEH` |
 | pool_contract | `CAKEWH7SJCXGV2MH2WZYIX3QDPTSSBQFXYVYBOWAGLNBBZMPLE2US6CS` |
+<!-- END_DEPLOYED_ADDRESSES -->
+
+> **Note**: Testnet addresses are subject to rotation. See [DEPLOYMENT.md](./DEPLOYMENT.md#contract-address-lifecycle--rotation-policy) for our redeployment and lifecycle policy.
 
 Verify on [Stellar Expert Testnet](https://stellar.expert/explorer/testnet)
 
@@ -261,6 +297,7 @@ Verify on [Stellar Expert Testnet](https://stellar.expert/explorer/testnet)
 
 - Rust 1.85.0 (required — other versions either have WASM bugs or are blocked by Stellar CLI)
 - [Stellar CLI](https://github.com/stellar/stellar-cli) (latest)
+- [jq](https://jqlang.github.io/jq/download/) (latest) — required by `scripts/maintainer/update-readme-addresses.sh`, which runs automatically at the end of `deploy.sh`
 
 ### 1. Install Rust 1.85.0
 
@@ -361,6 +398,16 @@ The goal is LP-governed capital allocation:
 
 If you want to contribute to governance design, open an issue tagged `complexity:high` and link your proposal.
 
+### `trigger_default` is admin-gated, not time-based
+
+`invoice::trigger_default` requires `admin.require_auth()`. Although the on-chain eligibility check enforces `now >= due_date`, the function is **not** an automatic time-based trigger — an admin must explicitly call it. This creates a single point of control over declaring defaults.
+
+**Risk:** Delays or failure to call `trigger_default` in time prevents the pool from recovering funds via `escrow::handle_default`, which could harm LP returns. A compromised admin could also misuse this power.
+
+**Current design rationale:** A human-in-the-loop check before declaring a default prevents accidental defaults from clock drift, chain reorgs, or misconfigured automation. It also allows for off-chain negotiations (grace periods, extensions) before a default is formally recorded.
+
+**Roadmap:** Introduce a permissionless time-based default mechanism where any caller can trigger a default for an invoice past its `due_date + grace_period`, without requiring admin authorization. The admin would retain only an override capability (e.g., to halt a false default).
+
 ### No emergency pause mechanism
 
 There is currently no circuit breaker. If a critical bug is found post-deployment the only recourse is to stop directing traffic to the affected contracts via the frontend.
@@ -387,6 +434,7 @@ Detailed references for contributors and integrators:
 - [Threat Model](./docs/THREAT_MODEL.md) — trust assumptions, auth gates, attack vectors
 - [Storage Schema](./docs/STORAGE.md) — on-chain data layout, TTL patterns, gas estimates
 - [Limitations](./docs/LIMITATIONS.md) — testnet constraints, known gaps, unhandled edge cases
+- [Event Catalog](./docs/EVENTS.md) — every emitted event, topics, data schema, and emitting contract
 
 ### Key conventions
 
@@ -416,3 +464,4 @@ MIT — see [CHANGELOG.md](./CHANGELOG.md) for version history.
 ## Contributors
 
 [![Contributors](https://contrib.rocks/image?repo=TrusTrove/TrusTrove-contract)](https://github.com/TrusTrove/TrusTrove-contract/graphs/contributors)
+// fix

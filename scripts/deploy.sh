@@ -14,6 +14,53 @@
 
 set -euo pipefail
 
+# Load configuration from .env (falling back to .env.example) using safe
+# line-by-line parsing. Unlike `source`, this never executes arbitrary shell
+# commands, so shell metacharacters in the file cannot be used for code
+# execution (see CVE / issue #455).
+load_env() {
+  local file="$1"
+  if [ ! -f "$file" ]; then
+    echo "Warning: $file not found; skipping." >&2
+    return 1
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    # Trim surrounding whitespace
+    line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    # Skip blank lines and comments
+    [ -z "$line" ] && continue
+    case "$line" in
+      \#*) continue ;;
+    esac
+    # Only accept KEY=VALUE pairs
+    case "$line" in
+      *=*)
+        key="${line%%=*}"
+        value="${line#*=}"
+        # Trim trailing whitespace from the key
+        key="$(printf '%s' "$key" | sed 's/[[:space:]]*$//')"
+        # Strip matching surrounding quotes from the value
+        case "$value" in
+          \"*\") value="${value#\"}"; value="${value%\"}" ;;
+          \'*\') value="${value#\'}"; value="${value%\'}" ;;
+        esac
+        # Only export keys that are valid shell identifiers; anything else
+        # (e.g. keys with spaces or special characters) is skipped.
+        case "$key" in
+          *[!A-Za-z0-9_]*|'') continue ;;
+        esac
+        export "$key=$value"
+        ;;
+    esac
+  done < "$file"
+}
+
+if [ -f .env ]; then
+  load_env .env
+else
+  load_env .env.example
+fi
+
 # ---------------------------------------------------------------------------
 # 0. CLI / env setup
 # ---------------------------------------------------------------------------
@@ -58,9 +105,9 @@ else
 fi
 
 if [ -f .env ]; then
-  source .env
+  load_env .env
 else
-  source .env.example
+  load_env .env.example
 fi
 
 # ---------------------------------------------------------------------------
@@ -321,12 +368,12 @@ invoke_init "pool_usdc" "$POOL_USDC_ID" \
   --usdc_asset "$USDC_ISSUER"
 
 echo ""
-echo "=== Deploying XLM escrow_contract ==="
+echo "=== Deploying XLM escrow_contract (EXPERIMENTAL) ==="
 ESCROW_XLM_ID=$(deploy_contract "escrow_xlm" "target/wasm32v1-none/release/trusttrove_escrow.wasm")
 echo "XLM Escrow: $ESCROW_XLM_ID"
 
 echo ""
-echo "=== Deploying XLM pool_contract ==="
+echo "=== Deploying XLM pool_contract (EXPERIMENTAL) ==="
 POOL_XLM_ID=$(deploy_contract "pool_xlm" "target/wasm32v1-none/release/trusttrove_pool.wasm")
 echo "XLM Pool: $POOL_XLM_ID"
 
@@ -366,16 +413,34 @@ cat > "$ENV_OUT" <<EOF
 NEXT_PUBLIC_REGISTRY_CONTRACT_ID=$REGISTRY_ID
 NEXT_PUBLIC_INVOICE_CONTRACT_ID=$INVOICE_ID
 NEXT_PUBLIC_ESCROW_USDC_CONTRACT_ID=$ESCROW_USDC_ID
-NEXT_PUBLIC_ESCROW_XLM_CONTRACT_ID=$ESCROW_XLM_ID
+NEXT_PUBLIC_ESCROW_XLM_CONTRACT_ID=$ESCROW_XLM_ID # EXPERIMENTAL
 NEXT_PUBLIC_POOL_USDC_CONTRACT_ID=$POOL_USDC_ID
-NEXT_PUBLIC_POOL_XLM_CONTRACT_ID=$POOL_XLM_ID
+NEXT_PUBLIC_POOL_XLM_CONTRACT_ID=$POOL_XLM_ID # EXPERIMENTAL
 EOF
+
+JSON_OUT="deployments.json"
+cat > "$JSON_OUT" <<EOF
+{
+  "registry": "$REGISTRY_ID",
+  "invoice": "$INVOICE_ID",
+  "escrow_usdc": "$ESCROW_USDC_ID",
+  "escrow_xlm": "$ESCROW_XLM_ID",
+  "pool_usdc": "$POOL_USDC_ID",
+  "pool_xlm": "$POOL_XLM_ID",
+  "updated_at": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+}
+EOF
+
+if [ -f "scripts/maintainer/update-readme-addresses.sh" ]; then
+  bash scripts/maintainer/update-readme-addresses.sh
+fi
 
 echo ""
 echo "==========================================="
 echo "Deployment complete."
 echo ""
 echo "Addresses saved to: $ADDRESSES_FILE"
+echo "JSON addresses saved to: $JSON_OUT"
 echo "Frontend env saved to: $ENV_OUT"
 echo ""
 echo "Add to trusttrove-app .env.local:"
